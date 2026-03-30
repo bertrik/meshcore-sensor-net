@@ -2,11 +2,14 @@
 #include <stdbool.h>
 #include <atomic>
 
+#include "mbedtls/base64.h"
+
 #include <Arduino.h>
+#include <WiFi.h>
 #include <LittleFS.h>
 
-#include <ESPAsyncWiFiManager.h>
 #include <ESPmDNS.h>
+#include <PubSubClient.h>
 
 #include <RadioLib.h>
 #include <MiniShell.h>
@@ -25,14 +28,22 @@
 #define LORA_PREAMBLE 16
 #define LORA_USE_CRC true
 
-static DNSServer dns;
 static AsyncWebServer server(80);
-static AsyncWiFiManager wifiManager(&server, &dns);
 
 static MiniShell shell(&Serial);
 static SX1262 radio = new Module(41, 39, 42, 40);
 static std::atomic_bool rf_event;
 static uint8_t rf_buffer[256];
+static WiFiClient espClient;
+static PubSubClient mqtt(espClient);
+static char mqtt_host[128];
+static char mqtt_user[32];
+static char mqtt_pass[32];
+static char device_id[32];
+
+// shared JSON buffers
+static StaticJsonDocument < 1024 > doc;
+static char json[1024];
 
 static void handle_radio_interrupt(void)
 {
@@ -72,6 +83,65 @@ static bool lora_init(void)
     return true;
 }
 
+static void mqtt_check_connect(void)
+{
+    strcpy(mqtt_host, config_get_value("mqtt_broker_host").c_str());
+    uint16_t mqtt_port = config_get_value("mqtt_broker_port").toInt();
+
+    char will_topic[64];
+    sprintf(will_topic, "%s/%s/status", config_get_value("mqtt_topic").c_str(), device_id);
+    strcpy(mqtt_user, config_get_value("mqtt_user").c_str());
+    strcpy(mqtt_pass, config_get_value("mqtt_pass").c_str());
+
+    doc.clear();
+    doc["id"] = device_id;
+    JsonObject lora = doc.createNestedObject("lora");
+    lora["freq"] = config_get_value("lora_freq");
+    lora["sf"] = config_get_value("lora_sf");
+    lora["bw"] = config_get_value("lora_bw");
+    lora["cr"] = config_get_value("lora_cr");
+    lora["sync"] = config_get_value("lora_sync");
+    serializeJson(doc, json, sizeof(json));
+
+    // attempt connect
+    printf("Connecting with topic '%s' to %s:%d...", will_topic, mqtt_host, mqtt_port);
+    mqtt.setServer(mqtt_host, mqtt_port);
+    if (mqtt.connect("meshcore-gw", mqtt_pass, mqtt_pass, will_topic, 0, true, "", true)) {
+        mqtt.publish(will_topic, json, true);
+    }
+}
+
+static void mqtt_uplink(const uint8_t *data, size_t size, float rssi, float snr)
+{
+    char topic[64];
+    unsigned char b64[512];
+
+    // build topic
+    sprintf(topic, "%s/%s/uplink", config_get_value("mqtt_topic").c_str(), device_id);
+
+    // build payload
+    size_t b64_len = 0;
+    int res = mbedtls_base64_encode(b64,
+                                    sizeof(b64),
+                                    &b64_len,
+                                    data,
+                                    size);
+    b64[b64_len] = 0;
+
+    doc.clear();
+    doc["id"] = device_id;
+    doc["time"] = time(NULL);
+    doc["rssi"] = rssi;
+    doc["snr"] = snr;
+    doc["data"] = b64;
+    size_t len = serializeJson(doc, json, sizeof(json));
+
+    printf("Created %d bytes json:", len);
+    printf(json);
+    printf("\n");
+    mqtt.publish(topic, json);
+}
+
 static int do_reboot(int argc, char *arg[])
 {
     ESP.restart();
@@ -90,18 +160,40 @@ static int do_datetime(int argc, char *argv[])
     return 0;
 }
 
+static int do_connect(int argc, char *argv[])
+{
+    mqtt_check_connect();
+    return 0;
+}
+
+static int do_wifi(int argc, char *argv[])
+{
+    if (argc > 1) {
+        char *ssid = argv[1];
+        const char *pass = (argc > 2) ? argv[2] : "";
+        WiFi.begin(ssid, pass);
+    }
+    return (WiFi.status() == WL_CONNECTED) ? 0 : -2;
+}
+
 const cmd_t commands[] = {
     { "reboot", do_reboot, "Reboot" },
     { "datetime", do_datetime, "Show current date/time" },
+    { "connect", do_connect, "Connect MQTT" },
+    { "wifi", do_wifi, "[<ssid> [pass]] Configure WiFi" },
     { NULL, NULL, NULL }
 };
 
 void setup(void)
 {
     Serial.begin(115200);
-    printf("Hello gateway!\n");
 
-    wifiManager.autoConnect("meshcore-gw");
+    uint64_t chipid = ESP.getEfuseMac();
+    sprintf(device_id, "esp32-%04x%08x", (uint16_t) (chipid >> 32), (uint32_t) chipid);
+    printf("Hello gateway: %s!\n", device_id);
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin();
 
     // NTP
     configTzTime("CET-1CEST,M3.5.0/02,M10.5.0/03", "nl.pool.ntp.org");
@@ -122,7 +214,7 @@ void setup(void)
         config_set_value("mqtt_broker_port", "1883");
         config_set_value("mqtt_user", "");
         config_set_value("mqtt_pass", "");
-        config_set_value("mqtt_topic", "");
+        config_set_value("mqtt_topic", "sensornet");
         config_set_value("lora_freq", "869.618");
         config_set_value("lora_bw", "62.5");
         config_set_value("lora_sf", "8");
@@ -148,18 +240,22 @@ void loop(void)
     if (rf_event.exchange(false)) {
         uint32_t irq_status = radio.getIrqFlags();
 
+        // handle transmit
+        if (irq_status & RADIOLIB_SX126X_IRQ_TX_DONE) {
+            radio.finishTransmit();
+        }
         // handle receive
         if (irq_status & RADIOLIB_SX126X_IRQ_RX_DONE) {
             int num_bytes = radio.getPacketLength();
             radio.readData(rf_buffer, num_bytes);
-            int rssi = radio.getRSSI();
-            int snr = radio.getSNR();
-            printf("### Got %d bytes (RSSI: %d, SNR: %d), ", num_bytes, rssi, snr);
+            float rssi = radio.getRSSI();
+            float snr = radio.getSNR();
+            printf("### Got %d bytes (RSSI: %d, SNR: %d), ", num_bytes, (int) rssi, (int) snr);
             printhex("Raw:", rf_buffer, num_bytes, 0);
-        }
-        // handle transmit
-        if (irq_status & RADIOLIB_SX126X_IRQ_TX_DONE) {
-            radio.finishTransmit();
+
+            if (mqtt.connected()) {
+                mqtt_uplink(rf_buffer, num_bytes, rssi, snr);
+            }
         }
         // clear all interrupts
         radio.clearIrqFlags(irq_status);
@@ -167,4 +263,6 @@ void loop(void)
         // restart receive
         radio.startReceive();
     }
+
+    mqtt.loop();
 }
