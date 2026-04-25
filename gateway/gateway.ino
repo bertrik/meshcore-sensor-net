@@ -39,6 +39,7 @@ static PubSubClient mqtt(espClient);
 static char mqtt_host[128];
 static char mqtt_user[32];
 static char mqtt_pass[32];
+static int mqtt_err = 0;
 static char device_id[32];
 
 // shared JSON buffers
@@ -83,8 +84,15 @@ static bool lora_init(void)
     return true;
 }
 
-static void mqtt_check_connect(void)
+static void mqtt_keep_connected(void)
 {
+    mqtt.loop();
+
+    if ((WiFi.status() != WL_CONNECTED) || mqtt.connected()) {
+        // not online or already connected
+        return;
+    }
+
     strcpy(mqtt_host, config_get_value("mqtt_broker_host").c_str());
     uint16_t mqtt_port = config_get_value("mqtt_broker_port").toInt();
 
@@ -93,25 +101,26 @@ static void mqtt_check_connect(void)
     strcpy(mqtt_user, config_get_value("mqtt_user").c_str());
     strcpy(mqtt_pass, config_get_value("mqtt_pass").c_str());
 
-    doc.clear();
-    doc["id"] = device_id;
-    JsonObject lora = doc.createNestedObject("lora");
-    lora["freq"] = config_get_value("lora_freq");
-    lora["sf"] = config_get_value("lora_sf");
-    lora["bw"] = config_get_value("lora_bw");
-    lora["cr"] = config_get_value("lora_cr");
-    lora["sync"] = config_get_value("lora_sync");
-    serializeJson(doc, json, sizeof(json));
-
     // attempt connect
-    printf("Connecting with topic '%s' to %s:%d...", will_topic, mqtt_host, mqtt_port);
+    printf("Connecting to '%s:%d' ...\n", mqtt_host, mqtt_port);
     mqtt.setServer(mqtt_host, mqtt_port);
     if (mqtt.connect("meshcore-gw", mqtt_pass, mqtt_pass, will_topic, 0, true, "", true)) {
-        mqtt.publish(will_topic, json, true);
+        printf("Announcing status on topic '%s'...", will_topic);
+        doc.clear();
+        doc["id"] = device_id;
+        JsonObject lora = doc.createNestedObject("lora");
+        lora["freq"] = config_get_value("lora_freq");
+        lora["sf"] = config_get_value("lora_sf");
+        lora["bw"] = config_get_value("lora_bw");
+        lora["cr"] = config_get_value("lora_cr");
+        lora["sync"] = config_get_value("lora_sync");
+        serializeJson(doc, json, sizeof(json));
+        bool result = mqtt.publish(will_topic, json, true);
+        printf("%s\n", result ? "OK" : "FAIL");
     }
 }
 
-static void mqtt_uplink(const uint8_t *data, size_t size, float rssi, float snr)
+static boolean mqtt_uplink(const uint8_t *data, size_t size, float rssi, float snr)
 {
     char topic[64];
     unsigned char b64[512];
@@ -121,11 +130,7 @@ static void mqtt_uplink(const uint8_t *data, size_t size, float rssi, float snr)
 
     // build payload
     size_t b64_len = 0;
-    int res = mbedtls_base64_encode(b64,
-                                    sizeof(b64),
-                                    &b64_len,
-                                    data,
-                                    size);
+    int res = mbedtls_base64_encode(b64, sizeof(b64), &b64_len, data, size);
     b64[b64_len] = 0;
 
     doc.clear();
@@ -135,11 +140,7 @@ static void mqtt_uplink(const uint8_t *data, size_t size, float rssi, float snr)
     doc["snr"] = snr;
     doc["data"] = b64;
     size_t len = serializeJson(doc, json, sizeof(json));
-
-    printf("Created %d bytes json:", len);
-    printf(json);
-    printf("\n");
-    mqtt.publish(topic, json);
+    return mqtt.publish(topic, json);
 }
 
 static int do_reboot(int argc, char *arg[])
@@ -160,12 +161,6 @@ static int do_datetime(int argc, char *argv[])
     return 0;
 }
 
-static int do_connect(int argc, char *argv[])
-{
-    mqtt_check_connect();
-    return 0;
-}
-
 static int do_wifi(int argc, char *argv[])
 {
     if (argc > 1) {
@@ -179,7 +174,6 @@ static int do_wifi(int argc, char *argv[])
 const cmd_t commands[] = {
     { "reboot", do_reboot, "Reboot" },
     { "datetime", do_datetime, "Show current date/time" },
-    { "connect", do_connect, "Connect MQTT" },
     { "wifi", do_wifi, "[<ssid> [pass]] Configure WiFi" },
     { NULL, NULL, NULL }
 };
@@ -254,7 +248,14 @@ void loop(void)
             printhex("Raw:", rf_buffer, num_bytes, 0);
 
             if (mqtt.connected()) {
-                mqtt_uplink(rf_buffer, num_bytes, rssi, snr);
+                if (!mqtt_uplink(rf_buffer, num_bytes, rssi, snr)) {
+                    mqtt_err++;
+                    if (mqtt_err > 3) {
+                        esp_restart();
+                    }
+                } else {
+                    mqtt_err = 0;
+                }
             }
         }
         // clear all interrupts
@@ -264,5 +265,5 @@ void loop(void)
         radio.startReceive();
     }
 
-    mqtt.loop();
+    mqtt_keep_connected();
 }
