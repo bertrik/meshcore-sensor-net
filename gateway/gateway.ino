@@ -168,6 +168,10 @@ static int do_wifi(int argc, char *argv[])
         const char *pass = (argc > 2) ? argv[2] : "";
         WiFi.begin(ssid, pass);
     }
+    printf("SSID: %s\n", WiFi.SSID().c_str());
+    printf("GW:   %s\n", WiFi.gatewayIP().toString().c_str());
+    printf("IP:   %s\n", WiFi.localIP().toString().c_str());
+    printf("Page: http://%s\n", WiFi.localIP().toString().c_str());
     return (WiFi.status() == WL_CONNECTED) ? 0 : -2;
 }
 
