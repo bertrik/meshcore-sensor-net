@@ -81,27 +81,30 @@
         });
 
         // import from file
-        function importConfig() {
-            const fileInput = document.getElementById("file");
+        const fileInput = document.getElementById("file");
+        fileInput.onchange = function () {
+            const file = fileInput.files[0];
+            if (!file) return;
 
-            fileInput.onchange = function () {
-                const file = fileInput.files[0];
-                if (!file) return;
+            const reader = new FileReader();
 
-                const reader = new FileReader();
+            reader.onload = function () {
+                const config = JSON.parse(reader.result);
 
-                reader.onload = function () {
-                    const config = JSON.parse(reader.result);
-
-                    for (const name in config) {
-                        const el = document.querySelector("[name='" + name + "']");
-                        if (el) el.value = config[name];
-                    }
-                };
-
-                reader.readAsText(file);
+                for (const name in config) {
+                    const el = document.querySelector("[name='" + name + "']");
+                    if (el) el.value = config[name];
+                }
             };
 
+            reader.readAsText(file);
+
+            // allow re-selecting same file later
+            fileInput.value = "";
+        };
+
+        // just trigger picker
+        function importConfig() {
             fileInput.click();
         }
 
