@@ -21,8 +21,8 @@
 // LoRa settings
 #define LORA_CARRIER_FREQ 869.618
 #define LORA_BANDWIDTH 62.5
-#define LORA_SF 8
-#define LORA_CR 8
+#define LORA_SF 7
+#define LORA_CR 5
 #define LORA_SYNC_WORD 0x12
 #define LORA_POWER 22
 #define LORA_PREAMBLE 16
@@ -44,7 +44,7 @@ static char device_id[32];
 
 // shared JSON buffers
 static StaticJsonDocument < 1024 > doc;
-static char json[1024];
+static char json[2048];
 
 static void handle_radio_interrupt(void)
 {
@@ -254,6 +254,7 @@ void loop(void)
             if (mqtt.connected()) {
                 if (!mqtt_uplink(rf_buffer, num_bytes, rssi, snr)) {
                     mqtt_err++;
+                    printf("mqtt_uplink failed, mqtt_err is now %d\n", mqtt_err);
                     if (mqtt_err > 3) {
                         esp_restart();
                     }
