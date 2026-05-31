@@ -201,11 +201,11 @@ static size_t decrypt(uint8_t *dest, const uint8_t *key, const uint8_t *src, siz
 static void analyse(const uint8_t *data, size_t len)
 {
     const uint8_t *ptr = data;
-    const char *payload_types[] =
+    static const char *payload_types[] =
         { "REQ", "RESPONSE", "TXT_MSG", "ACK", "ADVERT", "GRP_TXT", "GRP_DATA", "ANON_REQ",
-        "PATH", "TRACE", "MULTIPART", "CONTROL", "rsvd", "rsvd", "rsvd", "RAW_CUSTOM"
+        "PATH", "TRACE", "MULTIPART", "CONTROL", "rsvd-0x0C", "rsvd-0x0D", "rsvd-0x0E", "RAW_CUSTOM"
     };
-    const char *route_types[] = { "TRANSPORT_FLOOD", "FLOOD", "DIRECT", "TRANSPORT_DIRECT" };
+    static const char *route_types[] = { "TRANSPORT_FLOOD", "FLOOD", "DIRECT", "TRANSPORT_DIRECT" };
 
     printhex("Raw:", data, len, 0);
     uint8_t header = *ptr++;
@@ -377,6 +377,7 @@ static void derive_mc_key(const char *value, uint8_t *dest, size_t dest_len)
 
 static int do_key(int argc, char *argv[])
 {
+    SHA256 sha;
     if (argc > 1) {
         char *keytype = argv[1];
         if (strcmp(keytype, "app") == 0) {
@@ -398,6 +399,9 @@ static int do_key(int argc, char *argv[])
                 derive_mc_key(region, nvdata.mc_region_key, sizeof(nvdata.mc_region_key));
                 char *channel = argv[3];
                 derive_mc_key(channel, nvdata.mc_channel_key, sizeof(nvdata.mc_channel_key));
+                sha.reset();
+                sha.update(nvdata.mc_channel_key, 16);
+                sha.finalize(&nvdata.mc_channel_hash, 1);
             } else {
                 printf("Syntax: key mc <region> <channel>\n");
             }
