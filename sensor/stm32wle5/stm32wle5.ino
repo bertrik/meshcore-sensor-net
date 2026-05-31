@@ -18,8 +18,8 @@
 // LoRa settings
 #define LORA_CARRIER_FREQ 869.618
 #define LORA_BANDWIDTH 62.5
-#define LORA_SF 8
-#define LORA_CR 8
+#define LORA_SF 7
+#define LORA_CR 5
 #define LORA_SYNC_WORD 0x12
 #define LORA_POWER 22
 #define LORA_PREAMBLE 16
@@ -40,7 +40,7 @@ static nvdata_t nvdata;
 static uint8_t device_id[4];
 static std::atomic_bool rf_event {
 false};
-static int mc_routing = 2;
+static int mc_routing = 1;
 
 static void handle_radio_interrupt(void)
 {
@@ -143,7 +143,38 @@ static int build_payload(uint8_t *buf, const uint8_t *id, uint32_t counter, cons
     return ptr - buf;
 }
 
-static void analyse(const uint8_t *data, int len)
+static size_t decrypt(uint8_t *dest, const uint8_t *key, const uint8_t *src, size_t len)
+{
+    SHA256 sha;
+    AES128 aes;
+    uint8_t buf[16];
+
+    if (len < 2) {
+        return -2;
+    }
+
+    sha.resetHMAC(key, 16);
+    aes.setKey(key, 16);
+    uint8_t *dp = dest;
+    const uint8_t *sp = src + 2;
+    size_t remain = len - 2;
+    while (remain > 0) {
+        int bsize = (remain > 16) ? 16 : remain;
+        sha.update(sp, bsize);
+        aes.decryptBlock(buf, sp);
+        memcpy(dp, buf, bsize);
+        dp += bsize;
+        sp += bsize;
+        remain -= bsize;
+    }
+
+    byte hash[2];
+    sha.finalizeHMAC(key, 16, &hash, sizeof(hash));
+
+    return memcmp(src, hash, 2) == 0 ? dp - dest : 0;
+}
+
+static void analyse(const uint8_t *data, size_t len)
 {
     const uint8_t *ptr = data;
     const char *payload_types[] =
@@ -159,12 +190,27 @@ static void analyse(const uint8_t *data, int len)
     printf("Header: %s, %s\n", payload_types[payload_type], route_types[route_type]);
     uint8_t path_len = *ptr++;
     if ((ptr + path_len) < (data + len)) {
-        printhex("Path:", ptr, data + len - ptr, 0);
-
+        printhex("Path:", ptr, path_len, 0);
     }
     ptr += path_len;
     if (ptr < (data + len)) {
-        printhex("Payload:", ptr, data + len - ptr);
+        int payload_len = len + data - ptr;
+        printhex("Payload:", ptr, payload_len);
+        if ((payload_type == 5) || (payload_type == 6)) {
+            // try to decode
+            uint8_t channel_hash = *ptr++;
+            if (channel_hash == nvdata.mc_channel_hash) {
+                int crypt_size = data + len - ptr;
+                printf("Channel hash 0x%02X match, decoding %d bytes...\n", channel_hash, crypt_size);
+                uint8_t plain[255];
+                size_t plain_size = decrypt(plain, nvdata.mc_channel_key, ptr, crypt_size);
+                if (plain_size > 0) {
+                    printhex("Plaintext:", plain, plain_size);
+                } else {
+                    printf("No decode ... %d\n", plain_size);
+                }
+            }
+        }
     }
 }
 
@@ -232,6 +278,10 @@ static int do_data(int argc, char *argv[])
     // transmit
     printhex("Transmit", rf_buffer, rf_len);
     int16_t result = radio.startTransmit(rf_buffer, rf_len);
+
+    // debug print analysis
+    analyse(rf_buffer, rf_len);
+
     return result;
 }
 
@@ -311,7 +361,7 @@ static int do_key(int argc, char *argv[])
     printhex("App device id:", device_id, sizeof(device_id), 0);
     printhex("App hash key:", nvdata.app_hashkey, sizeof(nvdata.app_hashkey), 0);
     printhex("MC channel key:", nvdata.mc_channel_key, sizeof(nvdata.mc_channel_key), 0);
-    printhex("App device id:", &nvdata.mc_channel_hash, 1, 0);
+    printhex("MC channel hash:", &nvdata.mc_channel_hash, 1, 0);
     return 0;
 }
 
