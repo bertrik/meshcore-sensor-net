@@ -31,6 +31,7 @@ typedef struct {
     uint8_t app_hashkey[32];
     uint8_t mc_channel_key[16];
     uint8_t mc_channel_hash;
+    uint8_t mc_region_key[16];
 } nvdata_t;
 
 static MiniShell shell(&Serial);
@@ -40,7 +41,7 @@ static nvdata_t nvdata;
 static uint8_t device_id[4];
 static std::atomic_bool rf_event {
 false};
-static int mc_routing = 1;
+static int mc_routing = 3;      // 0 = transport flood, 1 = flood, 2 = direct, 3 = transport direct
 
 static void handle_radio_interrupt(void)
 {
@@ -117,10 +118,10 @@ static int encrypt(uint8_t *dest, const uint8_t *key, const uint8_t *src, int sr
     return dp - dest;
 }
 
-static int build_payload(uint8_t *buf, const uint8_t *id, uint32_t counter, const uint8_t *key,
-                         const uint8_t *data, int len)
+static int build_app_payload(uint8_t *dest, const uint8_t *id, uint32_t counter, const uint8_t *key,
+                             const uint8_t *data, int len)
 {
-    uint8_t *ptr = buf;
+    uint8_t *ptr = dest;
 
     // id
     memcpy(ptr, id, 4);
@@ -136,11 +137,34 @@ static int build_payload(uint8_t *buf, const uint8_t *id, uint32_t counter, cons
     // MAC
     BLAKE2s blake;
     blake.reset(key, 32);
-    blake.update(buf, ptr - buf);
+    blake.update(dest, ptr - dest);
     blake.finalize(ptr, 4);
     ptr += 4;
 
-    return ptr - buf;
+    return ptr - dest;
+}
+
+static int build_group_payload(uint8_t *dest, const uint8_t *key, uint8_t channel_hash,
+                               const uint8_t *data, int len)
+{
+    uint8_t *ptr = dest;
+    *ptr++ = channel_hash;
+    ptr += encrypt(ptr, nvdata.mc_channel_key, data, len);
+    return ptr - dest;
+}
+
+static int calc_transport_code(uint8_t *code, const uint8_t *key, uint8_t payload_type,
+                               const uint8_t *buf, int len)
+{
+    SHA256 sha;
+
+    sha.resetHMAC(key, 16);
+    sha.update(&payload_type, 1);
+    sha.update(buf, len);
+    sha.finalizeHMAC(key, 16, code, 2);
+    code[2] = 0;
+    code[3] = 0;
+    return 4;
 }
 
 static size_t decrypt(uint8_t *dest, const uint8_t *key, const uint8_t *src, size_t len)
@@ -250,29 +274,39 @@ static int do_routing(int argc, char *argv[])
 
 static int do_data(int argc, char *argv[])
 {
-    uint8_t buf[255];
     uint8_t raw[128];
+    uint8_t app_buf[256];
+    uint8_t grp_buf[256];
 
     if (argc < 2) {
         return -1;
     }
-    int len = atoi(argv[1]);
-    if (len >= sizeof(raw)) {
+    int raw_len = atoi(argv[1]);
+    if (raw_len > sizeof(raw)) {
         return -2;
     }
-    printf("Sending %d bytes...\n", len);
+    printf("Sending %d bytes...\n", raw_len);
+    memset(raw, raw_len, raw_len);
 
-    // build payload
-    memset(raw, len, len);
-    int buf_len = build_payload(buf, device_id, nvdata.app_counter++, nvdata.app_hashkey, raw, len);
-    printhex("Payload", buf, buf_len);
+    // build app payload
+    int app_len =
+        build_app_payload(app_buf, device_id, nvdata.app_counter++, nvdata.app_hashkey, raw,
+                          raw_len);
+    printhex("App payload", app_buf, app_len);
 
     // build mc buffer
+    int grp_len =
+        build_group_payload(grp_buf, nvdata.mc_channel_key, nvdata.mc_channel_hash, app_buf,
+                            app_len);
+
     uint8_t *ptr = rf_buffer;
     *ptr++ = (0 << 6) | (6 << 2) | mc_routing;  // version(0) | group data (0x6)
+    if ((mc_routing == 0) || (mc_routing == 3)) {
+        ptr += calc_transport_code(ptr, nvdata.mc_region_key, 6, grp_buf, grp_len);
+    }
     *ptr++ = 0;                 // path
-    *ptr++ = nvdata.mc_channel_hash;
-    ptr += encrypt(ptr, nvdata.mc_channel_key, buf, buf_len);
+    memcpy(ptr, grp_buf, grp_len);
+    ptr += grp_len;
     int rf_len = ptr - rf_buffer;
 
     // transmit
@@ -287,7 +321,8 @@ static int do_data(int argc, char *argv[])
 
 static int do_text(int argc, char *argv[])
 {
-    uint8_t buf[255];
+    uint8_t app_buf[256];
+    uint8_t grp_buf[256];
 
     const char *user;
     const char *text;
@@ -303,25 +338,41 @@ static int do_text(int argc, char *argv[])
     }
 
     // build text payload
-    uint8_t *ptr = buf;
+    uint8_t *ptr = app_buf;
     memset(ptr, 0, 4);
     ptr += 4;
     *ptr++ = 0;
     ptr += sprintf((char *) ptr, "%s: %s", user, text);
-    int buf_len = ptr - buf;
+    int app_len = ptr - app_buf;
 
-    // build mc buffer
+    // build mc payload
+    int grp_len =
+        build_group_payload(grp_buf, nvdata.mc_channel_key, nvdata.mc_channel_hash, app_buf,
+                            app_len);
+
+    // build rf packet
     ptr = rf_buffer;
     *ptr++ = (0 << 6) | (5 << 2) | mc_routing;  // version(0) | group text (0x5)
+    if ((mc_routing == 0) || (mc_routing == 3)) {
+        ptr += calc_transport_code(ptr, nvdata.mc_region_key, 5, grp_buf, grp_len);
+    }
     *ptr++ = 0;                 // path
-    *ptr++ = nvdata.mc_channel_hash;
-    ptr += encrypt(ptr, nvdata.mc_channel_key, buf, buf_len);
+    memcpy(ptr, grp_buf, grp_len);
+    ptr += grp_len;
     int rf_len = ptr - rf_buffer;
 
     // transmit
     printhex("Transmit", rf_buffer, rf_len);
     int16_t result = radio.startTransmit(rf_buffer, rf_len);
     return result;
+}
+
+static void derive_mc_key(const char *value, uint8_t *dest, size_t dest_len)
+{
+    SHA256 sha;
+    sha.reset();
+    sha.update(value, strlen(value));
+    sha.finalize(dest, dest_len);
 }
 
 static int do_key(int argc, char *argv[])
@@ -339,20 +390,16 @@ static int do_key(int argc, char *argv[])
                 blake.update(device_id, sizeof(device_id));
                 blake.finalize(nvdata.app_hashkey, 32);
             } else {
-                printf("Syntax: key app <name> <secret>.\n");
+                printf("Syntax: key app <name> <secret>\n");
             }
         } else if (strcmp(keytype, "mc") == 0) {
-            if (argc > 2) {
-                char *channel = argv[2];
-                SHA256 sha;
-                sha.reset();
-                sha.update(channel, strlen(channel));
-                sha.finalize(nvdata.mc_channel_key, 16);
-                sha.reset();
-                sha.update(nvdata.mc_channel_key, 16);
-                sha.finalize(&nvdata.mc_channel_hash, 1);
+            if (argc > 3) {
+                char *region = argv[2];
+                derive_mc_key(region, nvdata.mc_region_key, sizeof(nvdata.mc_region_key));
+                char *channel = argv[3];
+                derive_mc_key(channel, nvdata.mc_channel_key, sizeof(nvdata.mc_channel_key));
             } else {
-                printf("Syntax: key mc <channel>.\n");
+                printf("Syntax: key mc <region> <channel>\n");
             }
         } else {
             printf("Need either 'app' or 'mc' argument.\n");
@@ -360,6 +407,7 @@ static int do_key(int argc, char *argv[])
     }
     printhex("App device id:", device_id, sizeof(device_id), 0);
     printhex("App hash key:", nvdata.app_hashkey, sizeof(nvdata.app_hashkey), 0);
+    printhex("MC region key:", nvdata.mc_region_key, sizeof(nvdata.mc_region_key), 0);
     printhex("MC channel key:", nvdata.mc_channel_key, sizeof(nvdata.mc_channel_key), 0);
     printhex("MC channel hash:", &nvdata.mc_channel_hash, 1, 0);
     return 0;
